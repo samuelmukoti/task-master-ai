@@ -7,17 +7,30 @@ import fs from 'fs';
 import path from 'path';
 import chalk from 'chalk';
 
-// Configuration and constants
-const CONFIG = {
+// Configuration object with defaults
+export const CONFIG = {
+  // AI Model Configuration
   model: process.env.MODEL || 'claude-3-7-sonnet-20250219',
   maxTokens: parseInt(process.env.MAX_TOKENS || '4000'),
   temperature: parseFloat(process.env.TEMPERATURE || '0.7'),
-  debug: process.env.DEBUG === "true",
-  logLevel: process.env.LOG_LEVEL || "info",
-  defaultSubtasks: parseInt(process.env.DEFAULT_SUBTASKS || "3"),
-  defaultPriority: process.env.DEFAULT_PRIORITY || "medium",
-  projectName: process.env.PROJECT_NAME || "Task Master",
-  projectVersion: "1.5.0" // Hardcoded version - ALWAYS use this value, ignore environment variable
+  
+  // Gemini Configuration
+  geminiModel: process.env.GEMINI_MODEL || 'gemini-1.5-flash',
+  
+  // Perplexity Configuration
+  perplexityModel: process.env.PERPLEXITY_MODEL || 'sonar-pro',
+  
+  // Debug and Logging
+  debug: process.env.DEBUG === 'true',
+  logLevel: process.env.LOG_LEVEL || 'info',
+  
+  // Task Management
+  defaultSubtasks: parseInt(process.env.DEFAULT_SUBTASKS || '3'),
+  defaultPriority: process.env.DEFAULT_PRIORITY || 'medium',
+  
+  // Project Information
+  projectName: process.env.PROJECT_NAME || 'MCP SaaS MVP',
+  projectVersion: process.env.PROJECT_VERSION || '1.0.0',
 };
 
 // Set up logging based on log level

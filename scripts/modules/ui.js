@@ -365,11 +365,14 @@ function displayHelp() {
   });
   
   envTable.push(
+    [`${chalk.yellow('GEMINI_API_KEY')}${chalk.reset('')}`, 
+     `${chalk.white('Your Google Gemini API key')}${chalk.reset('')}`, 
+     `${chalk.dim('Required if no ANTHROPIC_API_KEY')}${chalk.reset('')}`],
     [`${chalk.yellow('ANTHROPIC_API_KEY')}${chalk.reset('')}`, 
      `${chalk.white('Your Anthropic API key')}${chalk.reset('')}`, 
-     `${chalk.dim('Required')}${chalk.reset('')}`],
+     `${chalk.dim('Required if no GEMINI_API_KEY')}${chalk.reset('')}`],
     [`${chalk.yellow('MODEL')}${chalk.reset('')}`, 
-     `${chalk.white('Claude model to use')}${chalk.reset('')}`, 
+     `${chalk.white('Claude model to use (only for Anthropic)')}${chalk.reset('')}`, 
      `${chalk.dim(`Default: ${CONFIG.model}`)}${chalk.reset('')}`],
     [`${chalk.yellow('MAX_TOKENS')}${chalk.reset('')}`, 
      `${chalk.white('Maximum tokens for responses')}${chalk.reset('')}`, 

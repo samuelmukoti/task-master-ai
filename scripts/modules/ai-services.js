@@ -7,6 +7,7 @@
 
 import { Anthropic } from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import dotenv from 'dotenv';
 import { CONFIG, log, sanitizePrompt } from './utils.js';
 import { startLoadingIndicator, stopLoadingIndicator } from './ui.js';
@@ -15,33 +16,199 @@ import chalk from 'chalk';
 // Load environment variables
 dotenv.config();
 
-// Configure Anthropic client
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  // Add beta header for 128k token output
-  defaultHeaders: {
-    'anthropic-beta': 'output-128k-2025-02-19'
-  }
-});
-
-// Lazy-loaded Perplexity client
+// Initialize AI clients based on available API keys
+let gemini = null;
+let anthropic = null;
 let perplexity = null;
 
-/**
- * Get or initialize the Perplexity client
- * @returns {OpenAI} Perplexity client
- */
-function getPerplexityClient() {
-  if (!perplexity) {
-    if (!process.env.PERPLEXITY_API_KEY) {
-      throw new Error("PERPLEXITY_API_KEY environment variable is missing. Set it to use research-backed features.");
-    }
+// Configure Gemini client if API key is available
+if (process.env.GEMINI_API_KEY) {
+  try {
+    gemini = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    log('info', 'Initialized Gemini Pro client');
+  } catch (error) {
+    log('warn', `Failed to initialize Gemini client: ${error.message}`);
+  }
+}
+
+// Configure Anthropic client if API key is available
+if (process.env.ANTHROPIC_API_KEY) {
+  try {
+    anthropic = new Anthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+      defaultHeaders: {
+        'anthropic-beta': 'output-128k-2025-02-19'
+      }
+    });
+    log('info', 'Initialized Anthropic Claude client');
+  } catch (error) {
+    log('warn', `Failed to initialize Anthropic client: ${error.message}`);
+  }
+}
+
+// Configure Perplexity client if API key is available
+if (process.env.PERPLEXITY_API_KEY) {
+  try {
     perplexity = new OpenAI({
       apiKey: process.env.PERPLEXITY_API_KEY,
       baseURL: 'https://api.perplexity.ai',
     });
+    log('info', 'Initialized Perplexity client');
+  } catch (error) {
+    log('warn', `Failed to initialize Perplexity client: ${error.message}`);
+    log('warn', 'Research-backed features will not be available');
   }
-  return perplexity;
+}
+
+/**
+ * Get the primary AI client to use based on available API keys and priority
+ * @returns {Object} The AI client to use
+ * @throws {Error} If no AI clients are available
+ */
+function getPrimaryAIClient() {
+  if (gemini) {
+    return { client: gemini, type: 'gemini' };
+  } else if (anthropic) {
+    return { client: anthropic, type: 'anthropic' };
+  }
+  throw new Error('No AI clients available. Please provide either GEMINI_API_KEY or ANTHROPIC_API_KEY in your environment variables.');
+}
+
+/**
+ * Handle Claude API errors with user-friendly messages
+ * @param {Error} error - The error from Claude API
+ * @returns {string} User-friendly error message
+ */
+function handleClaudeError(error) {
+  // Check if it's a structured error response
+  if (error.type === 'error' && error.error) {
+    switch (error.error.type) {
+      case 'overloaded_error':
+        return 'Claude is currently experiencing high demand and is overloaded. Please wait a few minutes and try again.';
+      case 'rate_limit_error':
+        return 'You have exceeded the rate limit. Please wait a few minutes before making more requests.';
+      case 'invalid_request_error':
+        return 'There was an issue with the request format. If this persists, please report it as a bug.';
+      default:
+        return `Claude API error: ${error.error.message}`;
+    }
+  }
+  
+  // Check for network/timeout errors
+  if (error.message?.toLowerCase().includes('timeout')) {
+    return 'The request to Claude timed out. Please try again.';
+  }
+  if (error.message?.toLowerCase().includes('network')) {
+    return 'There was a network error connecting to Claude. Please check your internet connection and try again.';
+  }
+  
+  // Default error message
+  return `Error communicating with Claude: ${error.message}`;
+}
+
+/**
+ * Handle streaming request to AI model
+ * @param {string} prdContent - PRD content
+ * @param {string} prdPath - Path to the PRD file
+ * @param {number} numTasks - Number of tasks to generate
+ * @param {number} maxTokens - Maximum tokens
+ * @param {string} systemPrompt - System prompt
+ * @returns {Object} AI model's response
+ */
+async function handleStreamingRequest(prdContent, prdPath, numTasks, maxTokens, systemPrompt) {
+  const loadingIndicator = startLoadingIndicator('Generating tasks from PRD...');
+  let responseText = '';
+  let streamingInterval = null;
+  
+  try {
+    const { client, type } = getPrimaryAIClient();
+    
+    if (type === 'gemini') {
+      // Use Gemini model from config
+      log('info', `Using Gemini model: ${CONFIG.geminiModel}`);
+      const model = client.getGenerativeModel({ model: CONFIG.geminiModel });
+      
+      const prompt = `${systemPrompt}\n\nHere's the Product Requirements Document (PRD) to break down into ${numTasks} tasks:\n\n${prdContent}`;
+      
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      responseText = response.text();
+    } else {
+      // Use Anthropic Claude
+      const stream = await client.messages.create({
+        model: CONFIG.model,
+        max_tokens: maxTokens,
+        temperature: CONFIG.temperature,
+        system: systemPrompt,
+        messages: [
+          {
+            role: 'user',
+            content: `Here's the Product Requirements Document (PRD) to break down into ${numTasks} tasks:\n\n${prdContent}`
+          }
+        ],
+        stream: true
+      });
+      
+      // Update loading indicator to show streaming progress
+      let dotCount = 0;
+      const readline = await import('readline');
+      streamingInterval = setInterval(() => {
+        readline.cursorTo(process.stdout, 0);
+        process.stdout.write(`Receiving streaming response from ${type === 'gemini' ? 'Gemini' : 'Claude'}${'.'.repeat(dotCount)}`);
+        dotCount = (dotCount + 1) % 4;
+      }, 500);
+      
+      // Process the stream
+      for await (const chunk of stream) {
+        if (chunk.type === 'content_block_delta' && chunk.delta.text) {
+          responseText += chunk.delta.text;
+        }
+      }
+    }
+    
+    if (streamingInterval) clearInterval(streamingInterval);
+    stopLoadingIndicator(loadingIndicator);
+    
+    log('info', `Completed streaming response from ${type === 'gemini' ? 'Gemini' : 'Claude'} API!`);
+    
+    return processAIResponse(responseText, numTasks, 0, prdContent, prdPath);
+  } catch (error) {
+    if (streamingInterval) clearInterval(streamingInterval);
+    stopLoadingIndicator(loadingIndicator);
+    
+    // Get user-friendly error message
+    const userMessage = handleAIError(error);
+    log('error', userMessage);
+    console.error(chalk.red(userMessage));
+    
+    if (CONFIG.debug) {
+      log('debug', 'Full error:', error);
+      console.error(error);
+    }
+    
+    throw new Error(userMessage);
+  }
+}
+
+/**
+ * Handle AI errors with appropriate messages
+ * @param {Error} error - The error object
+ * @returns {string} User-friendly error message
+ */
+function handleAIError(error) {
+  if (error.type === 'invalid_request_error') {
+    return 'There was an issue with the request format. Please check your inputs and try again.';
+  }
+  
+  if (error.message?.includes('timed out')) {
+    return 'The request timed out. Please try again or reduce the complexity of your request.';
+  }
+  
+  if (error.message?.includes('network')) {
+    return 'A network error occurred. Please check your internet connection and try again.';
+  }
+  
+  return `Error communicating with AI service: ${error.message}`;
 }
 
 /**
@@ -87,56 +254,10 @@ function handleClaudeError(error) {
 async function callClaude(prdContent, prdPath, numTasks, retryCount = 0) {
   try {
     log('info', 'Calling Claude...');
-    
-    // Build the system prompt
-    const systemPrompt = `You are an AI assistant helping to break down a Product Requirements Document (PRD) into a set of sequential development tasks. 
-Your goal is to create ${numTasks} well-structured, actionable development tasks based on the PRD provided.
-
-Each task should follow this JSON structure:
-{
-  "id": number,
-  "title": string,
-  "description": string,
-  "status": "pending",
-  "dependencies": number[] (IDs of tasks this depends on),
-  "priority": "high" | "medium" | "low",
-  "details": string (implementation details),
-  "testStrategy": string (validation approach)
-}
-
-Guidelines:
-1. Create exactly ${numTasks} tasks, numbered from 1 to ${numTasks}
-2. Each task should be atomic and focused on a single responsibility
-3. Order tasks logically - consider dependencies and implementation sequence
-4. Early tasks should focus on setup, core functionality first, then advanced features
-5. Include clear validation/testing approach for each task
-6. Set appropriate dependency IDs (a task can only depend on tasks with lower IDs)
-7. Assign priority (high/medium/low) based on criticality and dependency order
-8. Include detailed implementation guidance in the "details" field
-
-Expected output format:
-{
-  "tasks": [
-    {
-      "id": 1,
-      "title": "Setup Project Repository",
-      "description": "...",
-      ...
-    },
-    ...
-  ],
-  "metadata": {
-    "projectName": "PRD Implementation",
-    "totalTasks": ${numTasks},
-    "sourceFile": "${prdPath}",
-    "generatedAt": "YYYY-MM-DD"
-  }
-}
-
-Important: Your response must be valid JSON only, with no additional explanation or comments.`;
-
+    // Build the system prompt (same as Gemini)
+    const systemPrompt = buildTaskSystemPrompt(numTasks, prdPath);
     // Use streaming request to handle large responses and show progress
-    return await handleStreamingRequest(prdContent, prdPath, numTasks, CONFIG.maxTokens, systemPrompt);
+    return await handleStreamingRequest(prdContent, prdPath, numTasks, CONFIG.maxTokens, systemPrompt, 'anthropic');
   } catch (error) {
     // Get user-friendly error message
     const userMessage = handleClaudeError(error);
@@ -164,72 +285,44 @@ Important: Your response must be valid JSON only, with no additional explanation
 }
 
 /**
- * Handle streaming request to Claude
+ * Call Gemini to generate tasks from a PRD
  * @param {string} prdContent - PRD content
  * @param {string} prdPath - Path to the PRD file
  * @param {number} numTasks - Number of tasks to generate
- * @param {number} maxTokens - Maximum tokens
- * @param {string} systemPrompt - System prompt
- * @returns {Object} Claude's response
+ * @param {number} retryCount - Retry count
+ * @returns {Object} Gemini's response
  */
-async function handleStreamingRequest(prdContent, prdPath, numTasks, maxTokens, systemPrompt) {
-  const loadingIndicator = startLoadingIndicator('Generating tasks from PRD...');
-  let responseText = '';
-  let streamingInterval = null;
-  
+async function callGemini(prdContent, prdPath, numTasks, retryCount = 0) {
   try {
-    // Use streaming for handling large responses
-    const stream = await anthropic.messages.create({
-      model: CONFIG.model,
-      max_tokens: maxTokens,
-      temperature: CONFIG.temperature,
-      system: systemPrompt,
-      messages: [
-        {
-          role: 'user',
-          content: `Here's the Product Requirements Document (PRD) to break down into ${numTasks} tasks:\n\n${prdContent}`
-        }
-      ],
-      stream: true
-    });
-    
-    // Update loading indicator to show streaming progress
-    let dotCount = 0;
-    const readline = await import('readline');
-    streamingInterval = setInterval(() => {
-      readline.cursorTo(process.stdout, 0);
-      process.stdout.write(`Receiving streaming response from Claude${'.'.repeat(dotCount)}`);
-      dotCount = (dotCount + 1) % 4;
-    }, 500);
-    
-    // Process the stream
-    for await (const chunk of stream) {
-      if (chunk.type === 'content_block_delta' && chunk.delta.text) {
-        responseText += chunk.delta.text;
-      }
-    }
-    
-    if (streamingInterval) clearInterval(streamingInterval);
-    stopLoadingIndicator(loadingIndicator);
-    
-    log('info', "Completed streaming response from Claude API!");
-    
-    return processClaudeResponse(responseText, numTasks, 0, prdContent, prdPath);
+    log('info', 'Calling Gemini...');
+    const systemPrompt = buildTaskSystemPrompt(numTasks, prdPath);
+    return await handleStreamingRequest(prdContent, prdPath, numTasks, CONFIG.maxTokens, systemPrompt, 'gemini');
   } catch (error) {
-    if (streamingInterval) clearInterval(streamingInterval);
-    stopLoadingIndicator(loadingIndicator);
-    
-    // Get user-friendly error message
-    const userMessage = handleClaudeError(error);
+    const userMessage = handleGeminiError(error);
     log('error', userMessage);
-    console.error(chalk.red(userMessage));
-    
-    if (CONFIG.debug) {
-      log('debug', 'Full error:', error);
+    if (retryCount < 2 && (
+      error.message?.toLowerCase().includes('timeout') ||
+      error.message?.toLowerCase().includes('network')
+    )) {
+      const waitTime = (retryCount + 1) * 5000;
+      log('info', `Waiting ${waitTime/1000} seconds before retry ${retryCount + 1}/2...`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      return await callGemini(prdContent, prdPath, numTasks, retryCount + 1);
+    } else {
+      console.error(chalk.red(userMessage));
+      if (CONFIG.debug) {
+        log('debug', 'Full error:', error);
+      }
+      throw new Error(userMessage);
     }
-    
-    throw new Error(userMessage);
   }
+}
+
+/**
+ * Build the system prompt for task generation (shared by Claude and Gemini)
+ */
+function buildTaskSystemPrompt(numTasks, prdPath) {
+  return `You are an AI assistant helping to break down a Product Requirements Document (PRD) into a set of sequential development tasks.\nYour goal is to create ${numTasks} well-structured, actionable development tasks based on the PRD provided.\n\nEach task should follow this JSON structure:\n{\n  "id": number,\n  "title": string,\n  "description": string,\n  "status": "pending",\n  "dependencies": number[] (IDs of tasks this depends on),\n  "priority": "high" | "medium" | "low",\n  "details": string (implementation details),\n  "testStrategy": string (validation approach)\n}\n\nGuidelines:\n1. Create exactly ${numTasks} tasks, numbered from 1 to ${numTasks}\n2. Each task should be atomic and focused on a single responsibility\n3. Order tasks logically - consider dependencies and implementation sequence\n4. Early tasks should focus on setup, core functionality first, then advanced features\n5. Include clear validation/testing approach for each task\n6. Set appropriate dependency IDs (a task can only depend on tasks with lower IDs)\n7. Assign priority (high/medium/low) based on criticality and dependency order\n8. Include detailed implementation guidance in the "details" field\n\nExpected output format:\n{\n  "tasks": [\n    {\n      "id": 1,\n      "title": "Setup Project Repository",\n      "description": "...",\n      ...\n    },\n    ...\n  ],\n  "metadata": {\n    "projectName": "PRD Implementation",\n    "totalTasks": ${numTasks},\n    "sourceFile": "${prdPath}",\n    "generatedAt": "YYYY-MM-DD"\n  }\n}\n\nImportant: Your response must be valid JSON only, with no additional explanation or comments.`;
 }
 
 /**
@@ -670,11 +763,16 @@ IMPORTANT: Make sure to include an analysis for EVERY task listed above, with th
 export {
   getPerplexityClient,
   callClaude,
+  callGemini,
   handleStreamingRequest,
   processClaudeResponse,
+  processGeminiResponse,
   generateSubtasks,
   generateSubtasksWithPerplexity,
   parseSubtasksFromText,
   generateComplexityAnalysisPrompt,
-  handleClaudeError
+  handleClaudeError,
+  handleGeminiError,
+  handleAIError,
+  getPrimaryAIClient
 }; 

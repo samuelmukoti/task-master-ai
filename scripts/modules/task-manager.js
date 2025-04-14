@@ -35,6 +35,8 @@ import {
 
 import {
   callClaude,
+  callGemini,
+  getPrimaryAIClient,
   generateSubtasks,
   generateSubtasksWithPerplexity,
   generateComplexityAnalysisPrompt
@@ -83,8 +85,14 @@ async function parsePRD(prdPath, tasksPath, numTasks) {
     // Read the PRD content
     const prdContent = fs.readFileSync(prdPath, 'utf8');
     
-    // Call Claude to generate tasks
-    const tasksData = await callClaude(prdContent, prdPath, numTasks);
+    // Prefer Gemini if available, otherwise fall back to Claude
+    let tasksData;
+    const { type } = getPrimaryAIClient();
+    if (type === 'gemini') {
+      tasksData = await callGemini(prdContent, prdPath, numTasks);
+    } else {
+      tasksData = await callClaude(prdContent, prdPath, numTasks);
+    }
     
     // Create the directory if it doesn't exist
     const tasksDir = path.dirname(tasksPath);
@@ -198,14 +206,15 @@ The changes described in the prompt should be applied to ALL tasks in the list.`
     const taskData = JSON.stringify(tasksToUpdate, null, 2);
     
     let updatedTasks;
+    // Prefer Gemini if available, otherwise fall back to Claude for updating tasks
+    const { type } = getPrimaryAIClient();
     const loadingIndicator = startLoadingIndicator(useResearch 
       ? 'Updating tasks with Perplexity AI research...' 
-      : 'Updating tasks with Claude AI...');
-    
+      : `Updating tasks with ${type === 'gemini' ? 'Gemini' : 'Claude'} AI...`);
+
     try {
       if (useResearch) {
         log('info', 'Using Perplexity AI for research-backed task updates');
-        
         // Call Perplexity AI using format consistent with ai-services.js
         const perplexityModel = process.env.PERPLEXITY_MODEL || 'sonar-pro';
         const result = await perplexity.chat.completions.create({
@@ -1178,8 +1187,13 @@ async function expandTask(taskId, numSubtasks = CONFIG.defaultSubtasks, useResea
       log('info', 'Using Perplexity AI for research-backed subtask generation');
       subtasks = await generateSubtasksWithPerplexity(task, numSubtasks, nextSubtaskId, additionalContext);
     } else {
-      log('info', 'Generating subtasks with Claude only');
-      subtasks = await generateSubtasks(task, numSubtasks, nextSubtaskId, additionalContext);
+      // Prefer Gemini if available, otherwise fall back to Claude
+      const { type } = getPrimaryAIClient();
+      if (type === 'gemini') {
+        subtasks = await callGemini(task, null, numSubtasks, 0, additionalContext, 'subtask');
+      } else {
+        subtasks = await generateSubtasks(task, numSubtasks, nextSubtaskId, additionalContext);
+      }
     }
     
     // Add the subtasks to the task
@@ -1397,7 +1411,13 @@ async function expandAllTasks(numSubtasks = CONFIG.defaultSubtasks, useResearch 
         if (useResearch) {
           subtasks = await generateSubtasksWithPerplexity(task, taskSubtasks, nextSubtaskId, taskContext);
         } else {
-          subtasks = await generateSubtasks(task, taskSubtasks, nextSubtaskId, taskContext);
+          // Prefer Gemini if available, otherwise fall back to Claude
+          const { type } = getPrimaryAIClient();
+          if (type === 'gemini') {
+            subtasks = await callGemini(task, null, taskSubtasks, 0, taskContext, 'subtask');
+          } else {
+            subtasks = await generateSubtasks(task, taskSubtasks, nextSubtaskId, taskContext);
+          }
         }
         
         // Add the subtasks to the task
@@ -1609,74 +1629,52 @@ async function addTask(tasksPath, prompt, dependencies = [], priority = 'medium'
     "details": "In-depth details including specifics on implementation, considerations, and anything important for the developer to know. This should be detailed enough to guide implementation.",
     "testStrategy": "A detailed approach for verifying the task has been correctly implemented. Include specific test cases or validation methods."
   }`;
-  
-  const userPrompt = `Create a comprehensive new task (Task #${newTaskId}) for a software development project based on this description: "${prompt}"
-  
-  ${contextTasks}
-  
-  Return your answer as a single JSON object with the following structure:
-  ${taskStructure}
-  
-  Don't include the task ID, status, dependencies, or priority as those will be added automatically.
-  Make sure the details and test strategy are thorough and specific.
-  
-  IMPORTANT: Return ONLY the JSON object, nothing else.`;
-  
-  // Start the loading indicator
-  const loadingIndicator = startLoadingIndicator('Generating new task with Claude AI...');
-  
-  let fullResponse = '';
-  let streamingInterval = null;
 
-  try {
-    // Call Claude with streaming enabled
-    const stream = await anthropic.messages.create({
-      max_tokens: CONFIG.maxTokens,
-      model: CONFIG.model,
-      temperature: CONFIG.temperature,
-      messages: [{ role: "user", content: userPrompt }],
-      system: systemPrompt,
-      stream: true
-    });
-    
-    // Update loading indicator to show streaming progress
-    let dotCount = 0;
-    streamingInterval = setInterval(() => {
-      readline.cursorTo(process.stdout, 0);
-      process.stdout.write(`Receiving streaming response from Claude${'.'.repeat(dotCount)}`);
-      dotCount = (dotCount + 1) % 4;
-    }, 500);
-    
-    // Process the stream
-    for await (const chunk of stream) {
-      if (chunk.type === 'content_block_delta' && chunk.delta.text) {
-        fullResponse += chunk.delta.text;
-      }
-    }
-    
-    if (streamingInterval) clearInterval(streamingInterval);
-    stopLoadingIndicator(loadingIndicator);
-    
-    log('info', "Completed streaming response from Claude API!");
-    log('debug', `Streaming response length: ${fullResponse.length} characters`);
-    
-    // Parse the response - handle potential JSON formatting issues
-    let taskData;
+  let taskData;
+  const { type } = getPrimaryAIClient();
+  if (type === 'gemini') {
+    // Use Gemini to generate the new task
+    taskData = await callGemini(systemPrompt, null, 1, 0, '', 'addTask');
+  } else {
+    // Use Claude (existing streaming logic)
+    let fullResponse = '';
+    let streamingInterval = null;
     try {
+      const stream = await anthropic.messages.create({
+        max_tokens: CONFIG.maxTokens,
+        model: CONFIG.model,
+        temperature: CONFIG.temperature,
+        messages: [{ role: "user", content: systemPrompt }],
+        system: "You are an expert software project manager. Respond only with valid JSON.",
+        stream: true
+      });
+      let dotCount = 0;
+      streamingInterval = setInterval(() => {
+        readline.cursorTo(process.stdout, 0);
+        process.stdout.write(`Receiving streaming response from Claude${'.'.repeat(dotCount)}`);
+        dotCount = (dotCount + 1) % 4;
+      }, 500);
+      for await (const chunk of stream) {
+        if (chunk.type === 'content_block_delta' && chunk.delta.text) {
+          fullResponse += chunk.delta.text;
+        }
+      }
+      clearInterval(streamingInterval);
+      stopLoadingIndicator(loadingIndicator);
+      log('info', "Completed streaming response from Claude API!");
+      log('debug', `Streaming response length: ${fullResponse.length} characters`);
+      // Parse the response - handle potential JSON formatting issues
       // Check if the response is wrapped in a code block
       const jsonMatch = fullResponse.match(/```(?:json)?([^`]+)```/);
       const jsonContent = jsonMatch ? jsonMatch[1] : fullResponse;
-      
-      // Parse the JSON
       taskData = JSON.parse(jsonContent);
-      
-      // Check that we have the required fields
       if (!taskData.title || !taskData.description) {
-        throw new Error("Missing required fields in the generated task");
+        throw new Error('Missing required fields in the generated task.');
       }
     } catch (error) {
-      log('error', "Failed to parse Claude's response as valid task JSON:", error);
-      log('debug', "Response content:", fullResponse);
+      if (streamingInterval) clearInterval(streamingInterval);
+      stopLoadingIndicator(loadingIndicator);
+      log('error', "Error generating task:", error.message);
       process.exit(1);
     }
     
@@ -1755,16 +1753,18 @@ async function analyzeTaskComplexity(options) {
     
     // Prepare the prompt for the LLM
     const prompt = generateComplexityAnalysisPrompt(tasksData);
-    
-    // Start loading indicator
-    const loadingIndicator = startLoadingIndicator('Calling AI to analyze task complexity...');
-    
+
+    // Prefer Gemini if available, otherwise fall back to Claude for complexity analysis
+    const { type } = getPrimaryAIClient();
     let fullResponse = '';
     let streamingInterval = null;
-    
+    let usedGemini = false;
     try {
-      // If research flag is set, use Perplexity first
-      if (useResearch) {
+      if (type === 'gemini') {
+        // Use Gemini for complexity analysis
+        fullResponse = await callGemini(prompt, null, 1, 0, '', 'complexity');
+        usedGemini = true;
+      } else if (useResearch) {
         try {
           console.log(chalk.blue('Using Perplexity AI for research-backed complexity analysis...'));
           
